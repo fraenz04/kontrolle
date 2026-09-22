@@ -261,6 +261,34 @@
   }
   .note-actions{display:flex;gap:10px;margin-top:14px;}
   .note-actions .btn{flex:1;}
+
+  .toggle-row{
+    display:flex;align-items:center;justify-content:space-between;gap:14px;
+    padding:12px 0 22px;
+  }
+  .toggle-title{font-size:14px;font-weight:600;color:var(--ink);}
+  .toggle-sub{font-size:12px;color:var(--ink-soft);margin-top:2px;line-height:1.4;}
+  .switch{position:relative;display:inline-block;width:46px;height:27px;flex:0 0 auto;}
+  .switch input{opacity:0;width:0;height:0;}
+  .switch .slider{
+    position:absolute;cursor:pointer;inset:0;
+    background:var(--line);transition:.15s;border-radius:27px;
+  }
+  .switch .slider:before{
+    content:"";position:absolute;height:21px;width:21px;left:3px;top:3px;
+    background:#fff;transition:.15s;border-radius:50%;
+    box-shadow:0 1px 2px rgba(0,0,0,0.3);
+  }
+  .switch input:checked + .slider{background:var(--accent);}
+  .switch input:checked + .slider:before{transform:translateX(19px);}
+
+  .map-badge{
+    position:absolute;top:6px;left:6px;
+    min-width:20px;height:20px;padding:0 5px;
+    background:var(--accent);color:#fff;
+    border-radius:10px;font-size:11px;font-weight:700;
+    display:flex;align-items:center;justify-content:center;
+  }
 </style>
 </head>
 <body>
@@ -300,6 +328,16 @@
         <label for="in-mail-extra">Zusätzliche E-Mail-Empfänger (optional)</label>
         <input type="text" id="in-mail-extra" autocomplete="off" placeholder="name1@firma.de, name2@firma.de">
       </div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-title">Standort-Tracking</div>
+          <div class="toggle-sub">Zeichnet den Weg während der Kontrolle auf und fügt eine Streckenkarte mit Start/Ende ins PDF ein</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="in-tracking" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
       <button class="btn btn-primary" id="btn-start" disabled>Start Kontrolle</button>
       <div class="status-line" id="start-status"></div>
     </div>
@@ -326,7 +364,7 @@
 </main>
 
 <input type="file" accept="image/*" capture="environment" id="camera-input" style="display:none;">
-<input type="file" accept="image/*" id="gallery-input" style="display:none;">
+<input type="file" accept="image/*" id="gallery-input" multiple style="display:none;">
 
 <script>
 (function(){
@@ -510,6 +548,7 @@
   var inBaustelle = document.getElementById('in-baustelle');
   var inKostenstelle = document.getElementById('in-kostenstelle');
   var inVao = document.getElementById('in-vao');
+  var inTracking = document.getElementById('in-tracking');
   var inMailExtra = document.getElementById('in-mail-extra');
   var btnStart = document.getElementById('btn-start');
   var btnRecall = document.getElementById('btn-recall');
@@ -536,6 +575,7 @@
     inKostenstelle.value = last.kostenstelle || '';
     inVao.value = last.vao || '';
     inMailExtra.value = last.extraRecipients || '';
+    inTracking.checked = (typeof last.trackingEnabled === 'boolean') ? last.trackingEnabled : true;
     checkStartValid();
   });
 
@@ -553,7 +593,8 @@
       baustelle: inBaustelle.value.trim(),
       kostenstelle: inKostenstelle.value.trim(),
       vao: inVao.value.trim(),
-      extraRecipients: inMailExtra.value.trim()
+      extraRecipients: inMailExtra.value.trim(),
+      trackingEnabled: inTracking.checked
     };
     saveLastEntry(session);
     photos = [];
@@ -561,8 +602,9 @@
     buildCaptureScreen();
     showScreen('capture');
     // start continuous GPS tracking for the duration of the Kontrolle,
-    // ahead of the first photo, so it doesn't collide with the camera opening
-    startLocationWatch();
+    // ahead of the first photo, so it doesn't collide with the camera opening —
+    // only if the person left the tracking switch on
+    if(session.trackingEnabled) startLocationWatch();
   });
 
   // ---------- capture screen ----------
@@ -578,7 +620,7 @@
       '</div>'+
       '<div style="padding:18px 16px 0;">'+
         '<button class="btn btn-primary" id="btn-shoot">📷 &nbsp;Foto aufnehmen</button>'+
-        '<button class="btn btn-outline" id="btn-gallery" style="margin-top:10px;">Foto aus Galerie wählen</button>'+
+        '<button class="btn btn-outline" id="btn-gallery" style="margin-top:10px;">Foto(s) aus Galerie wählen</button>'+
         '<div class="status-line" id="capture-status"></div>'+
         '<div class="count-line"><h2 id="photo-count-label">0 Fotos</h2><span>2 Fotos pro Zeile, 4 pro PDF-Seite</span></div>'+
         '<div id="photo-grid"></div>'+
@@ -693,6 +735,7 @@
 
   var captureMode = 'camera';
 
+  var cancelGuardTimer = null;
   function startCapture(mode){
     if(busy) return;
     busy = true;
@@ -702,7 +745,10 @@
     var input = mode === 'gallery' ? galleryInput : cameraInput;
     input.value = '';
     input.click();
-    setTimeout(function(){
+    // if the user cancels the picker, no change event fires — release the
+    // button after a grace period. Cleared as soon as processing actually starts,
+    // so it never interrupts a longer multi-photo gallery import.
+    cancelGuardTimer = setTimeout(function(){
       if(busy){ busy = false; setShootButtons(false); setCaptureStatus(''); }
     }, 60000);
   }
@@ -728,12 +774,12 @@
       .catch(function(){ return { coords:null, taken:null }; });
   }
 
-  function handleFile(file){
+  function handleFile(file, progressLabel){
     var mode = captureMode;
-    if(!file){ busy = false; setShootButtons(false); setCaptureStatus(''); return; }
+    if(!file) return Promise.resolve();
 
-    setCaptureStatus('Foto wird verarbeitet, Standort wird ermittelt \u2026');
-    Promise.all([readFileAsDataUrl(file), currentLiveLocation(), readExif(file)]).then(function(res){
+    setCaptureStatus((progressLabel ? 'Foto ' + progressLabel + ' wird verarbeitet' : 'Foto wird verarbeitet') + ', Standort wird ermittelt \u2026');
+    return Promise.all([readFileAsDataUrl(file), currentLiveLocation(), readExif(file)]).then(function(res){
       var rawDataUrl = res[0], live = res[1], exif = res[2];
 
       // camera shot: live device position first, photo metadata second
@@ -752,7 +798,11 @@
       var locError = coords ? null : (live.errorMsg || 'Keine GPS-Daten im Foto.');
 
       return composePhoto(rawDataUrl, dateStr, locStr).then(function(composed){
-        photos.push({ dataUrl: composed, rawDataUrl: rawDataUrl, dateStr: dateStr, locStr: locStr, takenAt: when, locError: locError });
+        photos.push({
+          dataUrl: composed, rawDataUrl: rawDataUrl, dateStr: dateStr, locStr: locStr,
+          takenAt: when, locError: locError,
+          coords: coords ? { latitude: coords.latitude, longitude: coords.longitude } : null
+        });
         renderPhotos();
         if(locError){
           setCaptureStatus('Foto ' + photos.length + ' gespeichert, ohne Koordinaten. GPS: ' + (live.errorMsg || 'nicht verfügbar') + ' Foto-Metadaten: keine Koordinaten enthalten.', 'err');
@@ -762,14 +812,29 @@
       });
     }).catch(function(){
       setCaptureStatus('Foto konnte nicht verarbeitet werden. Bitte erneut versuchen.', 'err');
-    }).finally(function(){
-      busy = false;
-      setShootButtons(false);
     });
   }
 
-  cameraInput.addEventListener('change', function(e){ handleFile(e.target.files && e.target.files[0]); });
-  galleryInput.addEventListener('change', function(e){ handleFile(e.target.files && e.target.files[0]); });
+  cameraInput.addEventListener('change', function(e){ handleFileQueue([e.target.files && e.target.files[0]].filter(Boolean)); });
+  galleryInput.addEventListener('change', function(e){ handleFileQueue(Array.prototype.slice.call(e.target.files || [])); });
+
+  // process one or more picked files strictly in sequence (matters for gallery
+  // multi-select, so status text and photo order stay predictable)
+  function handleFileQueue(files){
+    if(cancelGuardTimer){ clearTimeout(cancelGuardTimer); cancelGuardTimer = null; }
+    if(!files || files.length === 0){ busy = false; setShootButtons(false); setCaptureStatus(''); return; }
+    var total = files.length;
+    var i = 0;
+    function next(){
+      if(i >= total){ busy = false; setShootButtons(false); return; }
+      var current = i + 1;
+      handleFile(files[i], total > 1 ? (current + ' / ' + total) : null).then(function(){
+        i++;
+        next();
+      });
+    }
+    next();
+  }
 
   function retryLocationForPhoto(idx){
     var p = photos[idx];
@@ -785,6 +850,7 @@
         photos[idx].dataUrl = composed;
         photos[idx].locStr = locStr;
         photos[idx].locError = null;
+        photos[idx].coords = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
         renderPhotos();
         setCaptureStatus('Koordinaten ergänzt.', 'ok');
       });
@@ -834,7 +900,7 @@
     session = null;
     photos = [];
     trackPoints = [];
-    inErfasser.value = ''; inBaustelle.value = ''; inKostenstelle.value = ''; inVao.value = ''; inMailExtra.value = '';
+    inErfasser.value = ''; inBaustelle.value = ''; inKostenstelle.value = ''; inVao.value = ''; inMailExtra.value = ''; inTracking.checked = true;
     checkStartValid();
     startStatus.textContent = '';
     if(loadLastEntry()) btnRecall.style.display = '';
@@ -889,7 +955,7 @@
     doc.text('Seite ' + pageNum + ' von ' + totalPages, pageW/2, pageH-10, {align:'center'});
   }
 
-  function drawPhotoGrid(doc, pagePhotos, startY, pageW){
+  function drawPhotoGrid(doc, pagePhotos, startY, pageW, startIndex){
     var margin = 15;
     var gap = 8;
     var cellW = (pageW - margin*2 - gap) / 2;
@@ -911,6 +977,14 @@
       doc.setLineWidth(0.2);
       doc.rect(x, y, cellW, imgBoxH);
       doc.addImage(p.dataUrl, 'JPEG', ox, oy, w, h);
+
+      var num = startIndex + i + 1;
+      var badgeR = 3.6;
+      doc.setFillColor(226,87,13);
+      doc.circle(x+badgeR+1.5, y+badgeR+1.5, badgeR, 'F');
+      doc.setFont('helvetica','bold'); doc.setFontSize(8);
+      doc.setTextColor(255,255,255);
+      doc.text(String(num), x+badgeR+1.5, y+badgeR+1.5+0.3, {align:'center', baseline:'middle'});
 
       if(p.note){
         doc.setFont('helvetica','normal');
@@ -943,20 +1017,18 @@
     });
   }
 
-  function buildTrackMapDataUrl(points){
-    if(!points || points.length < 2) return Promise.resolve(null);
-
+  // shared base: fetch OSM tiles covering `points`, return a ready 2d context
+  // plus a lon/lat -> canvas-pixel projector. Callers draw their own overlay.
+  function prepareMapCanvas(points, minSpan){
     var minLat=90,maxLat=-90,minLon=180,maxLon=-180;
     points.forEach(function(p){
       if(p.lat<minLat)minLat=p.lat; if(p.lat>maxLat)maxLat=p.lat;
       if(p.lon<minLon)minLon=p.lon; if(p.lon>maxLon)maxLon=p.lon;
     });
-    // minimum span so a near-stationary track still gets sensible context (~150m)
-    var minSpan = 0.0013;
+    minSpan = minSpan || 0.0013; // ~150m minimum context, even for a single point
     if(maxLat-minLat < minSpan){ var midLat=(maxLat+minLat)/2; minLat=midLat-minSpan/2; maxLat=midLat+minSpan/2; }
     if(maxLon-minLon < minSpan){ var midLon=(maxLon+minLon)/2; minLon=midLon-minSpan/2; maxLon=midLon+minSpan/2; }
-    // 12% padding around the track
-    var padLat=(maxLat-minLat)*0.12, padLon=(maxLon-minLon)*0.12;
+    var padLat=(maxLat-minLat)*0.15, padLon=(maxLon-minLon)*0.15;
     minLat-=padLat; maxLat+=padLat; minLon-=padLon; maxLon+=padLon;
 
     var W = 900, H = 620, bandH = 54, mapH = H - bandH;
@@ -996,22 +1068,40 @@
 
     return Promise.all(loads).then(function(results){
       var tilesOk = results.some(function(r){ return r; });
-
       function toXY(p){ return [ lonToPx(p.lon,zoom)-originX, latToPx(p.lat,zoom)-originY ]; }
+      ctx.strokeStyle='#c7c4bc'; ctx.lineWidth=1;
+      ctx.strokeRect(0.5,0.5,W-1,mapH-1);
+      ctx.fillStyle='#ffffff'; ctx.fillRect(0,mapH,W,bandH);
+      ctx.strokeStyle='#dcdad4'; ctx.beginPath(); ctx.moveTo(0,mapH); ctx.lineTo(W,mapH); ctx.stroke();
+      return { ctx:ctx, canvas:canvas, W:W, H:H, mapH:mapH, bandH:bandH, toXY:toXY, tilesOk:tilesOk };
+    });
+  }
 
+  function drawAttribution(m, tilesOk, extraLabel){
+    var ctx = m.ctx;
+    ctx.textAlign='right'; ctx.font='400 13px Inter, Arial, sans-serif'; ctx.fillStyle='#5a5a5a';
+    ctx.textBaseline='middle';
+    ctx.fillText(tilesOk ? '© OpenStreetMap contributors' : 'Kartenkacheln nicht verfügbar (offline)' + (extraLabel?' – '+extraLabel:''), m.W-14, m.mapH+m.bandH/2);
+    ctx.textAlign='left';
+  }
+
+  function buildTrackMapDataUrl(points){
+    if(!points || points.length < 2) return Promise.resolve(null);
+    return prepareMapCanvas(points).then(function(m){
+      var ctx = m.ctx;
       ctx.save();
-      ctx.beginPath(); ctx.rect(0,0,W,mapH); ctx.clip();
+      ctx.beginPath(); ctx.rect(0,0,m.W,m.mapH); ctx.clip();
       ctx.lineJoin='round'; ctx.lineCap='round';
       ctx.strokeStyle='rgba(255,255,255,0.9)'; ctx.lineWidth=6;
       ctx.beginPath();
-      points.forEach(function(p,i){ var xy=toXY(p); if(i===0) ctx.moveTo(xy[0],xy[1]); else ctx.lineTo(xy[0],xy[1]); });
+      points.forEach(function(p,i){ var xy=m.toXY(p); if(i===0) ctx.moveTo(xy[0],xy[1]); else ctx.lineTo(xy[0],xy[1]); });
       ctx.stroke();
       ctx.strokeStyle='#e2570d'; ctx.lineWidth=3.5;
       ctx.beginPath();
-      points.forEach(function(p,i){ var xy=toXY(p); if(i===0) ctx.moveTo(xy[0],xy[1]); else ctx.lineTo(xy[0],xy[1]); });
+      points.forEach(function(p,i){ var xy=m.toXY(p); if(i===0) ctx.moveTo(xy[0],xy[1]); else ctx.lineTo(xy[0],xy[1]); });
       ctx.stroke();
 
-      var startXY = toXY(points[0]), endXY = toXY(points[points.length-1]);
+      var startXY = m.toXY(points[0]), endXY = m.toXY(points[points.length-1]);
       function marker(xy, fill){
         ctx.beginPath(); ctx.arc(xy[0],xy[1],7,0,Math.PI*2);
         ctx.fillStyle=fill; ctx.fill();
@@ -1021,38 +1111,56 @@
       marker(endXY,'#b23a2e');
       ctx.restore();
 
-      ctx.strokeStyle='#c7c4bc'; ctx.lineWidth=1;
-      ctx.strokeRect(0.5,0.5,W-1,mapH-1);
-
-      // bottom info band
-      ctx.fillStyle='#ffffff'; ctx.fillRect(0,mapH,W,bandH);
-      ctx.strokeStyle='#dcdad4'; ctx.beginPath(); ctx.moveTo(0,mapH); ctx.lineTo(W,mapH); ctx.stroke();
-
-      ctx.fillStyle='#3c7a52'; ctx.beginPath(); ctx.arc(16,mapH+bandH/2,6,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#3c7a52'; ctx.beginPath(); ctx.arc(16,m.mapH+m.bandH/2,6,0,Math.PI*2); ctx.fill();
       ctx.fillStyle='#1c1c1c'; ctx.font='600 15px Inter, Arial, sans-serif'; ctx.textBaseline='middle';
-      ctx.fillText('Start', 30, mapH+bandH/2);
+      ctx.fillText('Start', 30, m.mapH+m.bandH/2);
+      ctx.fillStyle='#e2570d'; ctx.fillRect(90, m.mapH+m.bandH/2-2, 24, 4);
+      ctx.fillStyle='#1c1c1c'; ctx.fillText('GPS-Track (' + points.length + ' Punkte)', 122, m.mapH+m.bandH/2);
+      ctx.fillStyle='#b23a2e'; ctx.beginPath(); ctx.arc(m.W-330,m.mapH+m.bandH/2,6,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#1c1c1c'; ctx.fillText('Ende', m.W-316, m.mapH+m.bandH/2);
+      drawAttribution(m, m.tilesOk, 'nur Streckenverlauf dargestellt');
 
-      ctx.fillStyle='#e2570d'; ctx.fillRect(90, mapH+bandH/2-2, 24, 4);
-      ctx.fillStyle='#1c1c1c'; ctx.fillText('GPS-Track (' + points.length + ' Punkte)', 122, mapH+bandH/2);
-
-      ctx.fillStyle='#b23a2e'; ctx.beginPath(); ctx.arc(W-330,mapH+bandH/2,6,0,Math.PI*2); ctx.fill();
-      ctx.fillStyle='#1c1c1c'; ctx.fillText('Ende', W-316, mapH+bandH/2);
-
-      ctx.textAlign='right'; ctx.font='400 13px Inter, Arial, sans-serif'; ctx.fillStyle='#5a5a5a';
-      ctx.fillText(tilesOk ? '© OpenStreetMap contributors' : 'Kartenkacheln nicht verfügbar (offline) – nur Streckenverlauf dargestellt', W-14, mapH+bandH/2);
-      ctx.textAlign='left';
-
-      return { dataUrl: canvas.toDataURL('image/jpeg', 0.9), w: W, h: H };
+      return { dataUrl: m.canvas.toDataURL('image/jpeg', 0.9), w: m.W, h: m.H };
     });
   }
 
-  function drawMapPage(doc, pageW, map, createdAtStr, points){
+  // numbered markers — one per photo that has coordinates, using the photo's
+  // position number in the report so it matches the badge on the photo grid
+  function buildPhotoLocationsMapDataUrl(numberedPoints){
+    if(!numberedPoints || numberedPoints.length === 0) return Promise.resolve(null);
+    return prepareMapCanvas(numberedPoints).then(function(m){
+      var ctx = m.ctx;
+      ctx.save();
+      ctx.beginPath(); ctx.rect(0,0,m.W,m.mapH); ctx.clip();
+      numberedPoints.forEach(function(p){
+        var xy = m.toXY(p);
+        var label = String(p.num);
+        var r = label.length > 2 ? 15 : 12;
+        ctx.beginPath(); ctx.arc(xy[0],xy[1],r,0,Math.PI*2);
+        ctx.fillStyle='#e2570d'; ctx.fill();
+        ctx.lineWidth=2; ctx.strokeStyle='#ffffff'; ctx.stroke();
+        ctx.fillStyle='#ffffff'; ctx.font='700 13px Inter, Arial, sans-serif';
+        ctx.textAlign='center'; ctx.textBaseline='middle';
+        ctx.fillText(label, xy[0], xy[1]+0.5);
+      });
+      ctx.restore();
+      ctx.textAlign='left';
+
+      ctx.fillStyle='#e2570d'; ctx.beginPath(); ctx.arc(16,m.mapH+m.bandH/2,7,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#1c1c1c'; ctx.font='600 15px Inter, Arial, sans-serif'; ctx.textBaseline='middle';
+      ctx.fillText('Foto-Nr.  ·  ' + numberedPoints.length + ' von ' + photos.length + ' Fotos mit Standort', 32, m.mapH+m.bandH/2);
+      drawAttribution(m, m.tilesOk);
+
+      return { dataUrl: m.canvas.toDataURL('image/jpeg', 0.9), w: m.W, h: m.H };
+    });
+  }
+
+  function drawMapPage(doc, pageW, map, createdAtStr, title, subtitle){
     var startY = drawHeader(doc, pageW, createdAtStr);
     doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(28,28,28);
-    doc.text('Streckenverlauf während der Kontrolle (GPS-Tracking)', 15, startY);
-    var first = points[0], last = points[points.length-1];
+    doc.text(title, 15, startY);
     doc.setFont('helvetica','normal'); doc.setFontSize(8.5); doc.setTextColor(90,90,90);
-    doc.text(formatDateTime(new Date(first.t)) + '  bis  ' + formatDateTime(new Date(last.t)), 15, startY+5);
+    doc.text(subtitle, 15, startY+5);
 
     var margin = 15;
     var w = pageW - margin*2;
@@ -1070,21 +1178,45 @@
     var createdAtStr = formatDateTime(new Date());
     var trackSnapshot = trackPoints.slice();
 
-    return buildTrackMapDataUrl(trackSnapshot).then(function(map){
-      var totalWithMap = totalPages + (map ? 1 : 0);
+    var photoPoints = [];
+    photos.forEach(function(p, i){
+      if(p.coords) photoPoints.push({ num: i+1, lat: p.coords.latitude, lon: p.coords.longitude });
+    });
+
+    return Promise.all([
+      buildPhotoLocationsMapDataUrl(photoPoints),
+      buildTrackMapDataUrl(trackSnapshot)
+    ]).then(function(res){
+      var photoMap = res[0], trackMap = res[1];
+      var extraPages = (photoMap?1:0) + (trackMap?1:0);
+      var totalWithMaps = totalPages + extraPages;
+      var pageNum = 0;
+
       for(var page = 0; page < totalPages; page++){
-        if(page > 0) doc.addPage();
+        pageNum++;
+        if(pageNum > 1) doc.addPage();
         var startY = drawHeader(doc, pageW, createdAtStr);
         var pagePhotos = photos.slice(page*perPage, page*perPage + perPage);
-        drawPhotoGrid(doc, pagePhotos, startY, pageW);
-        drawFooter(doc, pageW, pageH, page+1, totalWithMap);
+        drawPhotoGrid(doc, pagePhotos, startY, pageW, page*perPage);
+        drawFooter(doc, pageW, pageH, pageNum, totalWithMaps);
       }
-      if(map){
+      if(photoMap){
+        pageNum++;
         doc.addPage();
-        drawMapPage(doc, pageW, map, createdAtStr, trackSnapshot);
-        drawFooter(doc, pageW, pageH, totalWithMap, totalWithMap);
+        drawMapPage(doc, pageW, photoMap, createdAtStr,
+          'Fotostandorte', photoPoints.length + ' von ' + photos.length + ' Fotos mit GPS-Koordinaten, Nummerierung wie im Bericht');
+        drawFooter(doc, pageW, pageH, pageNum, totalWithMaps);
       }
-      return { blob: doc.output('blob'), totalPages: totalWithMap };
+      if(trackMap){
+        pageNum++;
+        doc.addPage();
+        var first = trackSnapshot[0], last = trackSnapshot[trackSnapshot.length-1];
+        drawMapPage(doc, pageW, trackMap, createdAtStr,
+          'Streckenverlauf während der Kontrolle (GPS-Tracking)',
+          formatDateTime(new Date(first.t)) + '  bis  ' + formatDateTime(new Date(last.t)));
+        drawFooter(doc, pageW, pageH, pageNum, totalWithMaps);
+      }
+      return { blob: doc.output('blob'), totalPages: totalWithMaps };
     });
   }
 
