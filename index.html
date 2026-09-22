@@ -213,6 +213,54 @@
   @media (max-width:380px){
     .topbar h1{font-size:18px;}
   }
+
+  /* comment screen */
+  .note-card{
+    background:var(--paper);
+    border:1px solid var(--line);
+    border-radius:var(--radius);
+    overflow:hidden;
+  }
+  .note-card img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;}
+  .note-card .note-body{padding:8px 10px;}
+  .note-card .note-preview{
+    font-size:12px;color:var(--ink-soft);
+    min-height:16px;
+    white-space:pre-wrap;
+    word-break:break-word;
+  }
+  .note-card .note-preview.empty{font-style:italic;}
+  .note-card .note-btn{
+    margin-top:6px;width:100%;
+    background:none;border:1px solid var(--line);border-radius:var(--radius);
+    padding:7px;font-size:12px;font-weight:600;color:var(--ink);
+  }
+  .note-card.has-note .note-btn{border-color:var(--accent);color:var(--accent-ink);}
+
+  .note-overlay{
+    position:fixed;inset:0;
+    background:rgba(15,15,15,0.6);
+    display:flex;align-items:flex-end;justify-content:center;
+    z-index:50;
+    padding-bottom:env(safe-area-inset-bottom,0px);
+  }
+  .note-modal{
+    background:var(--paper);
+    width:100%;max-width:640px;
+    border-radius:var(--radius);
+    padding:18px 18px 20px;
+    max-height:88vh;overflow:auto;
+  }
+  .note-modal img{width:100%;max-height:220px;object-fit:cover;border-radius:var(--radius);margin-bottom:14px;}
+  .note-modal label{font-size:13px;font-weight:600;color:var(--ink-soft);display:block;margin-bottom:6px;}
+  .note-modal textarea{
+    width:100%;min-height:100px;
+    padding:12px;font-size:16px;font-family:inherit;color:var(--ink);
+    background:var(--offwhite);border:1px solid var(--line);border-radius:var(--radius);
+    resize:vertical;
+  }
+  .note-actions{display:flex;gap:10px;margin-top:14px;}
+  .note-actions .btn{flex:1;}
 </style>
 </head>
 <body>
@@ -230,7 +278,8 @@
   <!-- START -->
   <section class="screen active" id="screen-start">
     <div class="card">
-      <p class="intro">Angaben zur Kontrolle erfassen, dann Kontrolle starten. Jedes Foto wird automatisch mit Datum, Uhrzeit und GPS-Koordinaten gekennzeichnet.</p>
+      <p class="intro">Angaben zur Kontrolle erfassen, dann Kontrolle starten. Jedes Foto wird automatisch mit Datum, Uhrzeit und GPS-Koordinaten gekennzeichnet; der Standort wird während der gesamten Kontrolle laufend aufgezeichnet.</p>
+      <button class="btn btn-outline" id="btn-recall" type="button" style="margin-bottom:18px;display:none;">🔁 Angaben der letzten Kontrolle übernehmen</button>
       <div class="field">
         <label for="in-erfasser">Erfasser/in</label>
         <input type="text" id="in-erfasser" autocomplete="off" placeholder="Name">
@@ -239,9 +288,17 @@
         <label for="in-baustelle">Baustelle</label>
         <input type="text" id="in-baustelle" autocomplete="off" placeholder="Bezeichnung / Adresse">
       </div>
-      <div class="field" style="margin-bottom:22px;">
+      <div class="field">
         <label for="in-kostenstelle">Kostenstelle</label>
         <input type="text" id="in-kostenstelle" autocomplete="off" placeholder="Kostenstellen-Nr.">
+      </div>
+      <div class="field">
+        <label for="in-vao">Aktenzeichen VAO (optional)</label>
+        <input type="text" id="in-vao" autocomplete="off" placeholder="Aktenzeichen der Verkehrsanordnung">
+      </div>
+      <div class="field" style="margin-bottom:22px;">
+        <label for="in-mail-extra">Zusätzliche E-Mail-Empfänger (optional)</label>
+        <input type="text" id="in-mail-extra" autocomplete="off" placeholder="name1@firma.de, name2@firma.de">
       </div>
       <button class="btn btn-primary" id="btn-start" disabled>Start Kontrolle</button>
       <div class="status-line" id="start-status"></div>
@@ -250,6 +307,10 @@
 
   <!-- CAPTURE -->
   <section class="screen" id="screen-capture">
+  </section>
+
+  <!-- COMMENT -->
+  <section class="screen" id="screen-comment">
   </section>
 
   <!-- DONE -->
@@ -272,9 +333,22 @@
   "use strict";
 
   // ---------- state ----------
-  var session = null;      // {erfasser, baustelle, kostenstelle}
-  var photos = [];         // {dataUrl, dateStr, locStr, takenAt}
+  var session = null;      // {erfasser, baustelle, kostenstelle, extraRecipients}
+  var photos = [];         // {dataUrl, dateStr, locStr, takenAt, note}
   var pendingLocationPromise = null;
+  var watchId = null;
+  var lastLivePos = null;  // {coords, timestamp} from watchPosition
+  var trackPoints = [];   // {lat, lon, t} recorded continuously while a Kontrolle is open
+
+  // ====== Mail-Versand — bitte bei Bedarf anpassen ======
+  // endpoint: relativer oder absoluter Pfad zu send-mail.php (muss auf einem
+  // PHP-fähigen Webserver liegen, funktioniert NICHT auf GitHub Pages)
+  // defaultRecipient: feste Standard-Adresse, die immer eine Kopie bekommt (leer lassen = keine feste Adresse)
+  var MAIL_CONFIG = {
+    enabled: true,
+    endpoint: './send-mail.php',
+    defaultRecipient: ''
+  };
   var busy = false;
 
   // ---------- helpers ----------
@@ -325,6 +399,49 @@
         { enableHighAccuracy:true, timeout: timeoutMs, maximumAge: 0 }
       );
     });
+  }
+
+  // continuous tracking while a Kontrolle is open — keeps a fresh fix ready
+  // so each photo doesn't have to wait for (or re-trigger) a new GPS request
+  function distMeters(a, b){
+    var R = 6371000, rad = Math.PI/180;
+    var dLat = (b.lat-a.lat)*rad, dLon = (b.lon-a.lon)*rad;
+    var s1 = Math.sin(dLat/2)*Math.sin(dLat/2) +
+             Math.cos(a.lat*rad)*Math.cos(b.lat*rad)*Math.sin(dLon/2)*Math.sin(dLon/2);
+    return 2*R*Math.atan2(Math.sqrt(s1), Math.sqrt(1-s1));
+  }
+  function recordTrackPoint(coords, t){
+    var pt = { lat: coords.latitude, lon: coords.longitude, t: t };
+    var last = trackPoints[trackPoints.length-1];
+    // thin out points: only keep a new one if we moved >8m or >20s passed,
+    // so a stationary phone doesn't fill the track (and later map/tile budget) with noise
+    if(last && distMeters(last, pt) < 8 && (t - last.t) < 20000) return;
+    trackPoints.push(pt);
+    if(trackPoints.length > 800) trackPoints.shift(); // hard safety cap
+  }
+  function startLocationWatch(){
+    if(!navigator.geolocation || watchId !== null) return;
+    watchId = navigator.geolocation.watchPosition(
+      function(pos){
+        lastLivePos = { coords: pos.coords, timestamp: pos.timestamp || Date.now() };
+        recordTrackPoint(pos.coords, lastLivePos.timestamp);
+      },
+      function(){ /* keep the last known fix; a photo falls back to a one-off request */ },
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 }
+    );
+  }
+  function stopLocationWatch(){
+    if(watchId !== null){ navigator.geolocation.clearWatch(watchId); watchId = null; }
+    lastLivePos = null;
+  }
+  // fast path: use the continuously tracked position if it's recent enough,
+  // otherwise fall back to a one-off request
+  function currentLiveLocation(){
+    var maxAgeMs = 15000;
+    if(lastLivePos && (Date.now() - lastLivePos.timestamp) < maxAgeMs){
+      return Promise.resolve({ coords: lastLivePos.coords, errorCode:null, errorMsg:null });
+    }
+    return getLocation();
   }
 
   function readFileAsDataUrl(file){
@@ -378,6 +495,7 @@
   var screens = {
     start: document.getElementById('screen-start'),
     capture: document.getElementById('screen-capture'),
+    comment: document.getElementById('screen-comment'),
     done: document.getElementById('screen-done')
   };
   function showScreen(name){
@@ -391,8 +509,35 @@
   var inErfasser = document.getElementById('in-erfasser');
   var inBaustelle = document.getElementById('in-baustelle');
   var inKostenstelle = document.getElementById('in-kostenstelle');
+  var inVao = document.getElementById('in-vao');
+  var inMailExtra = document.getElementById('in-mail-extra');
   var btnStart = document.getElementById('btn-start');
+  var btnRecall = document.getElementById('btn-recall');
   var startStatus = document.getElementById('start-status');
+
+  var LAST_ENTRY_KEY = 'vsk_last_entry';
+  function loadLastEntry(){
+    try{
+      var raw = localStorage.getItem(LAST_ENTRY_KEY);
+      return raw ? JSON.parse(raw) : null;
+    }catch(e){ return null; }
+  }
+  function saveLastEntry(data){
+    try{ localStorage.setItem(LAST_ENTRY_KEY, JSON.stringify(data)); }catch(e){}
+  }
+  (function initRecall(){
+    if(loadLastEntry()) btnRecall.style.display = '';
+  })();
+  btnRecall.addEventListener('click', function(){
+    var last = loadLastEntry();
+    if(!last) return;
+    inErfasser.value = last.erfasser || '';
+    inBaustelle.value = last.baustelle || '';
+    inKostenstelle.value = last.kostenstelle || '';
+    inVao.value = last.vao || '';
+    inMailExtra.value = last.extraRecipients || '';
+    checkStartValid();
+  });
 
   function checkStartValid(){
     var ok = inErfasser.value.trim() && inBaustelle.value.trim() && inKostenstelle.value.trim();
@@ -406,14 +551,18 @@
     session = {
       erfasser: inErfasser.value.trim(),
       baustelle: inBaustelle.value.trim(),
-      kostenstelle: inKostenstelle.value.trim()
+      kostenstelle: inKostenstelle.value.trim(),
+      vao: inVao.value.trim(),
+      extraRecipients: inMailExtra.value.trim()
     };
+    saveLastEntry(session);
     photos = [];
+    trackPoints = [];
     buildCaptureScreen();
     showScreen('capture');
-    // trigger the location permission prompt now, ahead of the first photo,
-    // so it doesn't collide with the camera opening
-    if(navigator.geolocation){ navigator.geolocation.getCurrentPosition(function(){}, function(){}, { timeout: 12000 }); }
+    // start continuous GPS tracking for the duration of the Kontrolle,
+    // ahead of the first photo, so it doesn't collide with the camera opening
+    startLocationWatch();
   });
 
   // ---------- capture screen ----------
@@ -434,20 +583,99 @@
         '<div class="count-line"><h2 id="photo-count-label">0 Fotos</h2><span>2 Fotos pro Zeile, 4 pro PDF-Seite</span></div>'+
         '<div id="photo-grid"></div>'+
         '<div class="sticky-bottom">'+
-          '<button class="btn btn-dark" id="btn-finish" disabled>Kontrolle beenden &amp; PDF erstellen</button>'+
+          '<button class="btn btn-dark" id="btn-finish" disabled>Weiter: Fotos kommentieren</button>'+
           '<button class="btn btn-text" id="btn-cancel" style="width:100%;margin-top:4px;">Kontrolle abbrechen</button>'+
         '</div>'+
       '</div>';
 
     document.getElementById('btn-shoot').addEventListener('click', function(){ startCapture('camera'); });
     document.getElementById('btn-gallery').addEventListener('click', function(){ startCapture('gallery'); });
-    document.getElementById('btn-finish').addEventListener('click', finishAndGeneratePdf);
+    document.getElementById('btn-finish').addEventListener('click', goToComments);
     document.getElementById('btn-cancel').addEventListener('click', function(){
       if(photos.length === 0 || confirm('Kontrolle wirklich abbrechen? Bereits aufgenommene Fotos gehen verloren.')){
         resetToStart();
       }
     });
     renderPhotos();
+  }
+
+  // ---------- comment screen ----------
+  var commentRoot = document.getElementById('screen-comment');
+
+  function goToComments(){
+    buildCommentScreen();
+    showScreen('comment');
+  }
+
+  function buildCommentScreen(){
+    commentRoot.innerHTML =
+      '<div class="session-strip">'+
+        '<div class="row"><span><b>'+esc(session.erfasser)+'</b></span><span>'+esc(session.baustelle)+'</span></div>'+
+        '<div class="row"><span>Kostenstelle</span><span>'+esc(session.kostenstelle)+'</span></div>'+
+      '</div>'+
+      '<div style="padding:18px 16px 0;">'+
+        '<p class="intro" style="margin-bottom:16px;">Foto antippen, um eine Notiz hinzuzufügen. Die Notiz erscheint im PDF unter dem jeweiligen Foto.</p>'+
+        '<div id="comment-grid" class="grid"></div>'+
+        '<div class="sticky-bottom">'+
+          '<button class="btn btn-dark" id="btn-generate-pdf">Bericht erstellen (PDF)</button>'+
+          '<button class="btn btn-text" id="btn-back-capture" style="width:100%;margin-top:4px;">\u2190 Zurück zu Fotos</button>'+
+        '</div>'+
+        '<div class="status-line" id="comment-status"></div>'+
+      '</div>';
+
+    renderCommentGrid();
+    document.getElementById('btn-generate-pdf').addEventListener('click', finishAndGeneratePdf);
+    document.getElementById('btn-back-capture').addEventListener('click', function(){ showScreen('capture'); });
+  }
+
+  function renderCommentGrid(){
+    var grid = document.getElementById('comment-grid');
+    if(!grid) return;
+    grid.innerHTML = photos.map(function(p, i){
+      var hasNote = !!(p.note && p.note.trim());
+      return '<div class="note-card'+(hasNote?' has-note':'')+'" data-idx="'+i+'">'+
+               '<img src="'+p.dataUrl+'" alt="Foto '+(i+1)+'">'+
+               '<div class="note-body">'+
+                 '<div class="note-preview'+(hasNote?'':' empty')+'">'+esc(hasNote ? p.note : 'Keine Notiz')+'</div>'+
+                 '<button class="note-btn" type="button">'+(hasNote ? 'Notiz bearbeiten' : '+ Notiz hinzufügen')+'</button>'+
+               '</div>'+
+             '</div>';
+    }).join('');
+    Array.prototype.forEach.call(grid.querySelectorAll('.note-card'), function(card){
+      card.addEventListener('click', function(){
+        openNoteEditor(parseInt(card.getAttribute('data-idx'), 10));
+      });
+    });
+  }
+
+  function openNoteEditor(idx){
+    var p = photos[idx];
+    if(!p) return;
+    var overlay = document.createElement('div');
+    overlay.className = 'note-overlay';
+    overlay.innerHTML =
+      '<div class="note-modal">'+
+        '<img src="'+p.dataUrl+'" alt="Foto '+(idx+1)+'">'+
+        '<label for="note-text">Notiz zu Foto '+(idx+1)+'</label>'+
+        '<textarea id="note-text" rows="4" placeholder="z. B. Mangel, Maßnahme, Beobachtung \u2026"></textarea>'+
+        '<div class="note-actions">'+
+          '<button class="btn btn-outline" id="note-cancel" type="button">Abbrechen</button>'+
+          '<button class="btn btn-primary" id="note-save" type="button">Speichern</button>'+
+        '</div>'+
+      '</div>';
+    document.body.appendChild(overlay);
+    var textarea = document.getElementById('note-text');
+    textarea.value = p.note || '';
+    textarea.focus();
+
+    function close(){ document.body.removeChild(overlay); }
+    overlay.addEventListener('click', function(e){ if(e.target === overlay) close(); });
+    document.getElementById('note-cancel').addEventListener('click', close);
+    document.getElementById('note-save').addEventListener('click', function(){
+      photos[idx].note = textarea.value.trim();
+      close();
+      renderCommentGrid();
+    });
   }
 
   function esc(s){
@@ -505,7 +733,7 @@
     if(!file){ busy = false; setShootButtons(false); setCaptureStatus(''); return; }
 
     setCaptureStatus('Foto wird verarbeitet, Standort wird ermittelt \u2026');
-    Promise.all([readFileAsDataUrl(file), getLocation(), readExif(file)]).then(function(res){
+    Promise.all([readFileAsDataUrl(file), currentLiveLocation(), readExif(file)]).then(function(res){
       var rawDataUrl = res[0], live = res[1], exif = res[2];
 
       // camera shot: live device position first, photo metadata second
@@ -602,11 +830,14 @@
   }
 
   function resetToStart(){
+    stopLocationWatch();
     session = null;
     photos = [];
-    inErfasser.value = ''; inBaustelle.value = ''; inKostenstelle.value = '';
+    trackPoints = [];
+    inErfasser.value = ''; inBaustelle.value = ''; inKostenstelle.value = ''; inVao.value = ''; inMailExtra.value = '';
     checkStartValid();
     startStatus.textContent = '';
+    if(loadLastEntry()) btnRecall.style.display = '';
     showScreen('start');
   }
 
@@ -635,14 +866,20 @@
     doc.text('Erfasser/in: ' + session.erfasser, 15, infoY);
     doc.text('Baustelle: ' + session.baustelle, 15, infoY+5);
     doc.text('Kostenstelle: ' + session.kostenstelle, 15, infoY+10);
+    var lineCount = 3;
+    if(session.vao){
+      doc.text('Aktenzeichen VAO: ' + session.vao, 15, infoY+15);
+      lineCount = 4;
+    }
     doc.setTextColor(100,100,100);
     doc.text('Erstellt am: ' + createdAtStr, pageW-15, infoY, {align:'right'});
 
+    var ruleY = infoY + (lineCount*5);
     doc.setDrawColor(226,87,13);
     doc.setLineWidth(0.6);
-    doc.line(15, infoY+15, pageW-15, infoY+15);
+    doc.line(15, ruleY, pageW-15, ruleY);
 
-    return infoY + 15 + 8;
+    return ruleY + 8;
   }
 
   function drawFooter(doc, pageW, pageH, pageNum, totalPages){
@@ -656,7 +893,9 @@
     var margin = 15;
     var gap = 8;
     var cellW = (pageW - margin*2 - gap) / 2;
-    var cellH = 78;
+    var imgBoxH = 60;
+    var noteBoxH = 16;
+    var cellH = imgBoxH + noteBoxH + 2;
 
     pagePhotos.forEach(function(p, i){
       var col = i % 2, row = Math.floor(i/2);
@@ -664,15 +903,161 @@
       var y = startY + row * (cellH + gap);
 
       var props = doc.getImageProperties(p.dataUrl);
-      var ratio = Math.min(cellW / props.width, cellH / props.height);
+      var ratio = Math.min(cellW / props.width, imgBoxH / props.height);
       var w = props.width * ratio, h = props.height * ratio;
-      var ox = x + (cellW - w) / 2, oy = y + (cellH - h) / 2;
+      var ox = x + (cellW - w) / 2, oy = y + (imgBoxH - h) / 2;
 
       doc.setDrawColor(220,218,212);
       doc.setLineWidth(0.2);
-      doc.rect(x, y, cellW, cellH);
+      doc.rect(x, y, cellW, imgBoxH);
       doc.addImage(p.dataUrl, 'JPEG', ox, oy, w, h);
+
+      if(p.note){
+        doc.setFont('helvetica','normal');
+        doc.setFontSize(8);
+        doc.setTextColor(60,60,60);
+        var lines = doc.splitTextToSize(p.note, cellW - 4).slice(0, 3);
+        doc.text(lines, x + 2, y + imgBoxH + 5);
+      }
     });
+  }
+
+  // ---------- GPS-track map (OSM tiles + drawn line) ----------
+  function lonToPx(lon, zoom){ return (lon+180)/360 * Math.pow(2,zoom) * 256; }
+  function latToPx(lat, zoom){
+    var rad = lat*Math.PI/180;
+    return (1 - Math.log(Math.tan(rad) + 1/Math.cos(rad))/Math.PI)/2 * Math.pow(2,zoom) * 256;
+  }
+  function loadTileImg(z,x,y,timeoutMs){
+    return new Promise(function(resolve){
+      var n = Math.pow(2,z);
+      var xw = ((x % n) + n) % n;
+      if(y < 0 || y >= n){ resolve(null); return; }
+      var img = new Image();
+      img.crossOrigin = 'anonymous';
+      var done = false;
+      var t = setTimeout(function(){ if(!done){ done=true; resolve(null); } }, timeoutMs || 5000);
+      img.onload = function(){ if(done) return; done=true; clearTimeout(t); resolve(img); };
+      img.onerror = function(){ if(done) return; done=true; clearTimeout(t); resolve(null); };
+      img.src = 'https://tile.openstreetmap.org/' + z + '/' + xw + '/' + y + '.png';
+    });
+  }
+
+  function buildTrackMapDataUrl(points){
+    if(!points || points.length < 2) return Promise.resolve(null);
+
+    var minLat=90,maxLat=-90,minLon=180,maxLon=-180;
+    points.forEach(function(p){
+      if(p.lat<minLat)minLat=p.lat; if(p.lat>maxLat)maxLat=p.lat;
+      if(p.lon<minLon)minLon=p.lon; if(p.lon>maxLon)maxLon=p.lon;
+    });
+    // minimum span so a near-stationary track still gets sensible context (~150m)
+    var minSpan = 0.0013;
+    if(maxLat-minLat < minSpan){ var midLat=(maxLat+minLat)/2; minLat=midLat-minSpan/2; maxLat=midLat+minSpan/2; }
+    if(maxLon-minLon < minSpan){ var midLon=(maxLon+minLon)/2; minLon=midLon-minSpan/2; maxLon=midLon+minSpan/2; }
+    // 12% padding around the track
+    var padLat=(maxLat-minLat)*0.12, padLon=(maxLon-minLon)*0.12;
+    minLat-=padLat; maxLat+=padLat; minLon-=padLon; maxLon+=padLon;
+
+    var W = 900, H = 620, bandH = 54, mapH = H - bandH;
+
+    var zoom = 18;
+    for(; zoom >= 2; zoom--){
+      var pw = lonToPx(maxLon,zoom) - lonToPx(minLon,zoom);
+      var ph = latToPx(minLat,zoom) - latToPx(maxLat,zoom);
+      if(pw <= W && ph <= mapH) break;
+    }
+
+    var centerPxX = (lonToPx(minLon,zoom)+lonToPx(maxLon,zoom))/2;
+    var centerPxY = (latToPx(minLat,zoom)+latToPx(maxLat,zoom))/2;
+    var originX = centerPxX - W/2;
+    var originY = centerPxY - mapH/2;
+
+    var tileMinX = Math.floor(originX/256), tileMaxX = Math.floor((originX+W)/256);
+    var tileMinY = Math.floor(originY/256), tileMaxY = Math.floor((originY+mapH)/256);
+
+    var canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    var ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#e7e5e0';
+    ctx.fillRect(0,0,W,mapH);
+
+    var loads = [];
+    for(var tx=tileMinX; tx<=tileMaxX; tx++){
+      for(var ty=tileMinY; ty<=tileMaxY; ty++){
+        (function(tx,ty){
+          loads.push(loadTileImg(zoom,tx,ty).then(function(img){
+            if(img) ctx.drawImage(img, tx*256-originX, ty*256-originY, 256, 256);
+            return !!img;
+          }));
+        })(tx,ty);
+      }
+    }
+
+    return Promise.all(loads).then(function(results){
+      var tilesOk = results.some(function(r){ return r; });
+
+      function toXY(p){ return [ lonToPx(p.lon,zoom)-originX, latToPx(p.lat,zoom)-originY ]; }
+
+      ctx.save();
+      ctx.beginPath(); ctx.rect(0,0,W,mapH); ctx.clip();
+      ctx.lineJoin='round'; ctx.lineCap='round';
+      ctx.strokeStyle='rgba(255,255,255,0.9)'; ctx.lineWidth=6;
+      ctx.beginPath();
+      points.forEach(function(p,i){ var xy=toXY(p); if(i===0) ctx.moveTo(xy[0],xy[1]); else ctx.lineTo(xy[0],xy[1]); });
+      ctx.stroke();
+      ctx.strokeStyle='#e2570d'; ctx.lineWidth=3.5;
+      ctx.beginPath();
+      points.forEach(function(p,i){ var xy=toXY(p); if(i===0) ctx.moveTo(xy[0],xy[1]); else ctx.lineTo(xy[0],xy[1]); });
+      ctx.stroke();
+
+      var startXY = toXY(points[0]), endXY = toXY(points[points.length-1]);
+      function marker(xy, fill){
+        ctx.beginPath(); ctx.arc(xy[0],xy[1],7,0,Math.PI*2);
+        ctx.fillStyle=fill; ctx.fill();
+        ctx.lineWidth=2; ctx.strokeStyle='#ffffff'; ctx.stroke();
+      }
+      marker(startXY,'#3c7a52');
+      marker(endXY,'#b23a2e');
+      ctx.restore();
+
+      ctx.strokeStyle='#c7c4bc'; ctx.lineWidth=1;
+      ctx.strokeRect(0.5,0.5,W-1,mapH-1);
+
+      // bottom info band
+      ctx.fillStyle='#ffffff'; ctx.fillRect(0,mapH,W,bandH);
+      ctx.strokeStyle='#dcdad4'; ctx.beginPath(); ctx.moveTo(0,mapH); ctx.lineTo(W,mapH); ctx.stroke();
+
+      ctx.fillStyle='#3c7a52'; ctx.beginPath(); ctx.arc(16,mapH+bandH/2,6,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#1c1c1c'; ctx.font='600 15px Inter, Arial, sans-serif'; ctx.textBaseline='middle';
+      ctx.fillText('Start', 30, mapH+bandH/2);
+
+      ctx.fillStyle='#e2570d'; ctx.fillRect(90, mapH+bandH/2-2, 24, 4);
+      ctx.fillStyle='#1c1c1c'; ctx.fillText('GPS-Track (' + points.length + ' Punkte)', 122, mapH+bandH/2);
+
+      ctx.fillStyle='#b23a2e'; ctx.beginPath(); ctx.arc(W-330,mapH+bandH/2,6,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#1c1c1c'; ctx.fillText('Ende', W-316, mapH+bandH/2);
+
+      ctx.textAlign='right'; ctx.font='400 13px Inter, Arial, sans-serif'; ctx.fillStyle='#5a5a5a';
+      ctx.fillText(tilesOk ? '© OpenStreetMap contributors' : 'Kartenkacheln nicht verfügbar (offline) – nur Streckenverlauf dargestellt', W-14, mapH+bandH/2);
+      ctx.textAlign='left';
+
+      return { dataUrl: canvas.toDataURL('image/jpeg', 0.9), w: W, h: H };
+    });
+  }
+
+  function drawMapPage(doc, pageW, map, createdAtStr, points){
+    var startY = drawHeader(doc, pageW, createdAtStr);
+    doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(28,28,28);
+    doc.text('Streckenverlauf während der Kontrolle (GPS-Tracking)', 15, startY);
+    var first = points[0], last = points[points.length-1];
+    doc.setFont('helvetica','normal'); doc.setFontSize(8.5); doc.setTextColor(90,90,90);
+    doc.text(formatDateTime(new Date(first.t)) + '  bis  ' + formatDateTime(new Date(last.t)), 15, startY+5);
+
+    var margin = 15;
+    var w = pageW - margin*2;
+    var h = w * (map.h/map.w);
+    doc.addImage(map.dataUrl, 'JPEG', margin, startY+10, w, h);
   }
 
   function buildPdfBlob(){
@@ -683,15 +1068,24 @@
     var perPage = 4;
     var totalPages = Math.max(1, Math.ceil(photos.length / perPage));
     var createdAtStr = formatDateTime(new Date());
+    var trackSnapshot = trackPoints.slice();
 
-    for(var page = 0; page < totalPages; page++){
-      if(page > 0) doc.addPage();
-      var startY = drawHeader(doc, pageW, createdAtStr);
-      var pagePhotos = photos.slice(page*perPage, page*perPage + perPage);
-      drawPhotoGrid(doc, pagePhotos, startY, pageW);
-      drawFooter(doc, pageW, pageH, page+1, totalPages);
-    }
-    return { blob: doc.output('blob'), totalPages: totalPages };
+    return buildTrackMapDataUrl(trackSnapshot).then(function(map){
+      var totalWithMap = totalPages + (map ? 1 : 0);
+      for(var page = 0; page < totalPages; page++){
+        if(page > 0) doc.addPage();
+        var startY = drawHeader(doc, pageW, createdAtStr);
+        var pagePhotos = photos.slice(page*perPage, page*perPage + perPage);
+        drawPhotoGrid(doc, pagePhotos, startY, pageW);
+        drawFooter(doc, pageW, pageH, page+1, totalWithMap);
+      }
+      if(map){
+        doc.addPage();
+        drawMapPage(doc, pageW, map, createdAtStr, trackSnapshot);
+        drawFooter(doc, pageW, pageH, totalWithMap, totalWithMap);
+      }
+      return { blob: doc.output('blob'), totalPages: totalWithMap };
+    });
   }
 
   function savePdf(blob, filename){
@@ -726,41 +1120,101 @@
     }
   }
 
+  function blobToBase64(blob){
+    return blob.arrayBuffer().then(function(buf){
+      var bytes = new Uint8Array(buf);
+      var binary = '';
+      var chunk = 0x8000;
+      for(var i=0; i<bytes.length; i+=chunk){
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i+chunk));
+      }
+      return btoa(binary);
+    });
+  }
+
+  function sendMailWithPdf(blob, filename){
+    var recipients = [];
+    if(MAIL_CONFIG.defaultRecipient) recipients.push(MAIL_CONFIG.defaultRecipient);
+    if(session.extraRecipients){
+      session.extraRecipients.split(',').forEach(function(a){
+        a = a.trim(); if(a) recipients.push(a);
+      });
+    }
+    if(!MAIL_CONFIG.enabled || recipients.length === 0){
+      return Promise.resolve({ attempted:false, sent:false, recipients:[] });
+    }
+    return blobToBase64(blob).then(function(b64){
+      var subject = 'Verkehrssicherungs-Kontrolle – ' + session.baustelle;
+      var body = 'Kostenstelle: ' + session.kostenstelle + '\n' +
+                 'Erfasser/in: ' + session.erfasser + '\n' +
+                 'Baustelle: ' + session.baustelle + '\n' +
+                 (session.vao ? 'Aktenzeichen VAO: ' + session.vao + '\n' : '') +
+                 'Erstellt am: ' + formatDateTime(new Date());
+      return fetch(MAIL_CONFIG.endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: recipients, subject: subject, body: body, filename: filename, pdfBase64: b64 })
+      }).then(function(resp){
+        if(!resp.ok) throw new Error('HTTP ' + resp.status);
+        return resp.json();
+      }).then(function(json){
+        return { attempted:true, sent: !!(json && json.ok), reason: json && json.error, recipients: recipients };
+      });
+    }).catch(function(err){
+      return { attempted:true, sent:false, reason: err.message, recipients: recipients };
+    });
+  }
+
   function finishAndGeneratePdf(){
     if(photos.length === 0 || busy) return;
     busy = true;
-    var finishBtn = document.getElementById('btn-finish');
+    var finishBtn = document.getElementById('btn-generate-pdf');
+    var statusEl = document.getElementById('comment-status');
     finishBtn.disabled = true;
     finishBtn.textContent = 'PDF wird erstellt \u2026';
-    setCaptureStatus('');
+    if(statusEl){ statusEl.textContent = 'Bericht wird zusammengestellt, ggf. inkl. Streckenkarte \u2026'; statusEl.className = 'status-line'; }
 
     setTimeout(function(){
-      try{
-        var result = buildPdfBlob();
-        var filename = 'Verkehrssicherung_' + slug(session.baustelle) + '_' + slug(formatDateTimeShort(new Date())) + '.pdf';
-        savePdf(result.blob, filename).then(function(ok){
-          busy = false;
-          showDone(filename, result.totalPages, ok);
+      buildPdfBlob().then(function(result){
+        var d = new Date();
+        var yymmdd = String(d.getFullYear()).slice(-2) + pad(d.getMonth()+1) + pad(d.getDate());
+        var kst = session.kostenstelle.replace(/[\\\/:*?"<>|]+/g, '-').trim();
+        var filename = kst + '_Kontrolle VS_' + yymmdd + '.pdf';
+        return savePdf(result.blob, filename).then(function(ok){
+          return sendMailWithPdf(result.blob, filename).then(function(mailResult){
+            busy = false;
+            stopLocationWatch();
+            showDone(filename, result.totalPages, ok, mailResult);
+          });
         });
-      }catch(err){
+      }).catch(function(err){
         busy = false;
         finishBtn.disabled = false;
-        finishBtn.textContent = 'Kontrolle beenden & PDF erstellen';
-        setCaptureStatus('PDF konnte nicht erstellt werden. Bitte erneut versuchen.', 'err');
-      }
+        finishBtn.textContent = 'Bericht erstellen (PDF)';
+        if(statusEl){ statusEl.textContent = 'PDF konnte nicht erstellt werden. Bitte erneut versuchen.'; statusEl.className = 'status-line err'; }
+      });
     }, 30);
   }
 
-  function showDone(filename, totalPages, saved){
+  function showDone(filename, totalPages, saved, mailResult){
     var el = document.getElementById('done-summary');
+    var mailLine = '';
+    if(mailResult && mailResult.attempted){
+      mailLine = mailResult.sent
+        ? '<div class="summary-row"><span>E-Mail</span><span>verschickt an ' + esc(mailResult.recipients.join(', ')) + '</span></div>'
+        : '<div class="status-line err" style="text-align:left;padding-top:8px;">E-Mail konnte nicht verschickt werden' + (mailResult.reason ? ' (' + esc(mailResult.reason) + ')' : '') + '. PDF wurde trotzdem gespeichert.</div>';
+    }
     el.innerHTML =
       '<div class="summary-row"><span>Baustelle</span><span>'+esc(session.baustelle)+'</span></div>'+
       '<div class="summary-row"><span>Erfasser/in</span><span>'+esc(session.erfasser)+'</span></div>'+
       '<div class="summary-row"><span>Kostenstelle</span><span>'+esc(session.kostenstelle)+'</span></div>'+
+      (session.vao ? '<div class="summary-row"><span>Aktenzeichen VAO</span><span>'+esc(session.vao)+'</span></div>' : '') +
       '<div class="summary-row"><span>Fotos</span><span>'+photos.length+'</span></div>'+
+      '<div class="summary-row"><span>GPS-Trackpunkte</span><span>'+trackPoints.length+'</span></div>'+
       '<div class="summary-row"><span>Seiten</span><span>'+totalPages+'</span></div>'+
       '<div class="summary-row"><span>Datei</span><span style="word-break:break-all;">'+esc(filename)+'</span></div>' +
-      (saved ? '' : '<div class="status-line err" style="text-align:left;padding-top:8px;">PDF konnte nicht automatisch gespeichert werden.</div>');
+      (saved ? '' : '<div class="status-line err" style="text-align:left;padding-top:8px;">PDF konnte nicht automatisch gespeichert werden.</div>') +
+      mailLine;
     showScreen('done');
   }
 
