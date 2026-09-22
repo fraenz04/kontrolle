@@ -778,36 +778,41 @@
     var mode = captureMode;
     if(!file) return Promise.resolve();
 
-    setCaptureStatus((progressLabel ? 'Foto ' + progressLabel + ' wird verarbeitet' : 'Foto wird verarbeitet') + ', Standort wird ermittelt \u2026');
-    return Promise.all([readFileAsDataUrl(file), currentLiveLocation(), readExif(file)]).then(function(res){
+    var prefix = progressLabel ? 'Foto ' + progressLabel + ' wird verarbeitet' : 'Foto wird verarbeitet';
+    setCaptureStatus(prefix + (mode === 'gallery' ? ', Foto-Metadaten werden gelesen \u2026' : ', Standort wird ermittelt \u2026'));
+
+    // gallery pick: use ONLY the photo's own metadata for date + place — a photo
+    // taken elsewhere on another day must never be stamped with today's live
+    // position, so the live GPS request is skipped entirely for this mode.
+    // camera shot: live device position is the primary source, EXIF a fallback.
+    var locationP = (mode === 'gallery') ? Promise.resolve({ coords:null, errorCode:null, errorMsg:null }) : currentLiveLocation();
+
+    return Promise.all([readFileAsDataUrl(file), locationP, readExif(file)]).then(function(res){
       var rawDataUrl = res[0], live = res[1], exif = res[2];
 
-      // camera shot: live device position first, photo metadata second
-      // gallery pick: the photo's own metadata first (where/when it was really taken)
       var coords, source;
       if(mode === 'gallery'){
         if(exif.coords){ coords = exif.coords; source = 'Foto-Metadaten'; }
-        else if(live.coords){ coords = live.coords; source = 'GPS beim Hochladen'; }
       } else {
         if(live.coords){ coords = live.coords; source = 'GPS'; }
         else if(exif.coords){ coords = exif.coords; source = 'Foto-Metadaten'; }
       }
-      var when = (mode === 'gallery' && exif.taken) ? exif.taken : new Date();
+      var when = exif.taken || (mode === 'gallery' ? new Date(file.lastModified || Date.now()) : new Date());
       var dateStr = formatDateTime(when);
       var locStr = coords ? formatLocation(coords) + ' (' + source + ')' : formatLocation(null);
-      var locError = coords ? null : (live.errorMsg || 'Keine GPS-Daten im Foto.');
+      var locError = coords ? null : (mode === 'gallery' ? 'Keine GPS-Daten im Foto enthalten.' : (live.errorMsg || 'Keine GPS-Daten im Foto.'));
 
       return composePhoto(rawDataUrl, dateStr, locStr).then(function(composed){
         photos.push({
           dataUrl: composed, rawDataUrl: rawDataUrl, dateStr: dateStr, locStr: locStr,
-          takenAt: when, locError: locError,
+          takenAt: when, locError: locError, source: mode,
           coords: coords ? { latitude: coords.latitude, longitude: coords.longitude } : null
         });
         renderPhotos();
         if(locError){
-          setCaptureStatus('Foto ' + photos.length + ' gespeichert, ohne Koordinaten. GPS: ' + (live.errorMsg || 'nicht verfügbar') + ' Foto-Metadaten: keine Koordinaten enthalten.', 'err');
+          setCaptureStatus('Foto ' + photos.length + ' gespeichert, ohne Koordinaten (' + locError + ')', 'err');
         } else {
-          setCaptureStatus('Foto ' + photos.length + ' gespeichert (Koordinaten aus ' + source + ').', 'ok');
+          setCaptureStatus('Foto ' + photos.length + ' gespeichert (Datum/Standort aus ' + source + ').', 'ok');
         }
       });
     }).catch(function(){
@@ -839,6 +844,24 @@
   function retryLocationForPhoto(idx){
     var p = photos[idx];
     if(!p) return;
+
+    // a gallery photo's real location is whatever was in its EXIF data (or
+    // nothing) — never substitute today's current position for a photo that
+    // may have been taken somewhere else on another day. Offer manual entry only.
+    if(p.source === 'gallery'){
+      var manual = window.prompt('Für importierte Fotos wird nie der aktuelle Standort eingesetzt.\nStandort manuell eintragen (z. B. Straße/Ort aus dem Original bekannt) oder leer lassen zum Abbrechen:', '');
+      if(!manual || !manual.trim()) return;
+      var manualStr = 'Standort (manuell): ' + manual.trim();
+      composePhoto(p.rawDataUrl, p.dateStr, manualStr).then(function(composed){
+        photos[idx].dataUrl = composed;
+        photos[idx].locStr = manualStr;
+        photos[idx].locError = null;
+        renderPhotos();
+        setCaptureStatus('Standort ergänzt.', 'ok');
+      });
+      return;
+    }
+
     setCaptureStatus('Standort wird erneut ermittelt \u2026');
     getLocation().then(function(loc){
       if(!loc.coords){
