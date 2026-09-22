@@ -495,7 +495,7 @@
     return new Promise(function(resolve, reject){
       var img = new Image();
       img.onload = function(){ resolve(img); };
-      img.onerror = reject;
+      img.onerror = function(){ reject(new Error('Bild konnte nicht dekodiert werden (evtl. nicht unterstütztes Format, z. B. HEIC)')); };
       img.src = src;
     });
   }
@@ -802,21 +802,32 @@
       var locStr = coords ? formatLocation(coords) + ' (' + source + ')' : formatLocation(null);
       var locError = coords ? null : (mode === 'gallery' ? 'Keine GPS-Daten im Foto enthalten.' : (live.errorMsg || 'Keine GPS-Daten im Foto.'));
 
-      return composePhoto(rawDataUrl, dateStr, locStr).then(function(composed){
+      // if burning the caption onto the image fails (e.g. an image format the
+      // browser can't decode into a <canvas>), still keep the photo rather
+      // than discarding it — just without the baked-in date/location text
+      var captionFailed = false;
+      return composePhoto(rawDataUrl, dateStr, locStr).catch(function(err){
+        captionFailed = true;
+        console.error('composePhoto failed:', err);
+        return rawDataUrl;
+      }).then(function(composed){
         photos.push({
           dataUrl: composed, rawDataUrl: rawDataUrl, dateStr: dateStr, locStr: locStr,
-          takenAt: when, locError: locError, source: mode,
+          takenAt: when, locError: locError, source: mode, captionBaked: !captionFailed,
           coords: coords ? { latitude: coords.latitude, longitude: coords.longitude } : null
         });
         renderPhotos();
-        if(locError){
+        if(captionFailed){
+          setCaptureStatus('Foto ' + photos.length + ' gespeichert, aber Datum/Standort konnten nicht ins Bild geschrieben werden (Format evtl. nicht unterstützt, z. B. HEIC). Die Angaben stehen aber in der PDF-Bildunterschrift.', 'err');
+        } else if(locError){
           setCaptureStatus('Foto ' + photos.length + ' gespeichert, ohne Koordinaten (' + locError + ')', 'err');
         } else {
           setCaptureStatus('Foto ' + photos.length + ' gespeichert (Datum/Standort aus ' + source + ').', 'ok');
         }
       });
-    }).catch(function(){
-      setCaptureStatus('Foto konnte nicht verarbeitet werden. Bitte erneut versuchen.', 'err');
+    }).catch(function(err){
+      console.error('handleFile failed:', err);
+      setCaptureStatus('Foto konnte nicht verarbeitet werden (' + (err && err.message ? err.message : 'unbekannter Fehler') + '). Bitte erneut versuchen.', 'err');
     });
   }
 
@@ -983,7 +994,7 @@
     var gap = 8;
     var cellW = (pageW - margin*2 - gap) / 2;
     var imgBoxH = 60;
-    var noteBoxH = 16;
+    var noteBoxH = 20;
     var cellH = imgBoxH + noteBoxH + 2;
 
     pagePhotos.forEach(function(p, i){
@@ -1009,12 +1020,24 @@
       doc.setTextColor(255,255,255);
       doc.text(String(num), x+badgeR+1.5, y+badgeR+1.5+0.3, {align:'center', baseline:'middle'});
 
+      var textY = y + imgBoxH + 4.5;
+      // the caption is normally baked into the JPEG itself; if that failed
+      // (unsupported image format), print date/location as plain text instead
+      // so the information isn't silently lost from the report
+      if(p.captionBaked === false){
+        doc.setFont('helvetica','italic');
+        doc.setFontSize(7.5);
+        doc.setTextColor(90,90,90);
+        doc.text(p.dateStr + '  ·  ' + p.locStr, x + 2, textY, { maxWidth: cellW - 4 });
+        textY += 4.2;
+      }
       if(p.note){
         doc.setFont('helvetica','normal');
         doc.setFontSize(8);
         doc.setTextColor(60,60,60);
-        var lines = doc.splitTextToSize(p.note, cellW - 4).slice(0, 3);
-        doc.text(lines, x + 2, y + imgBoxH + 5);
+        var maxNoteLines = (p.captionBaked === false) ? 2 : 3;
+        var lines = doc.splitTextToSize(p.note, cellW - 4).slice(0, maxNoteLines);
+        doc.text(lines, x + 2, textY);
       }
     });
   }
